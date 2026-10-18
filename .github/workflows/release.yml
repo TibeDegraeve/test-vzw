@@ -1,0 +1,124 @@
+# Cut a release: tags v<version>, publishes a GitHub Release whose notes are
+# the handwritten CHANGELOG section for that version, and publishes the
+# package to npm via trusted publishing (OIDC): no token, no secret. The
+# Trusted Publisher must be configured on npmjs.com for this repo and
+# workflow file; see RELEASING.md.
+#
+# Flow: write the CHANGELOG entry in a normal PR first, merge it, then run
+#   gh workflow run release.yml -R Mariatta/astro-theme-popular -f version=X.Y.Z
+# in BOTH repos (versions are tagged in lockstep; see PARITY.md).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z, no leading v); its CHANGELOG section must already be merged"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write # npm trusted publishing (OIDC)
+
+jobs:
+  release:
+    # theme-repo only: forks inherit this file but must not run it
+    if: github.repository == 'Mariatta/astro-theme-popular'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate
+        run: |
+          V="${{ inputs.version }}"
+          echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            || { echo "::error::version must be X.Y.Z (got '$V')"; exit 1; }
+          grep -q "^## \[$V\]" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no '## [$V]' section; write it in a PR first"; exit 1; }
+          if git ls-remote --tags origin "refs/tags/v$V" | grep -q .; then
+            echo "::error::tag v$V already exists"; exit 1
+          fi
+          PKG=$(node -p "require('./package.json').version")
+          [ "$PKG" = "${{ inputs.version }}" ] \
+            || { echo "::error::package.json says $PKG; bump it to ${{ inputs.version }} in the versioning PR"; exit 1; }
+          NPMPKG=$(node -p "require('./package/package.json').version")
+          [ "$NPMPKG" = "${{ inputs.version }}" ] \
+            || { echo "::error::package/package.json says $NPMPKG; bump it to ${{ inputs.version }} in the versioning PR"; exit 1; }
+          # create-popular-site pins the theme range it scaffolds with (^<its own
+          # version>), so a lagging version would hand new sites an old theme.
+          CREATE=$(node -p "require('./create-popular-site/package.json').version")
+          [ "$CREATE" = "${{ inputs.version }}" ] \
+            || { echo "::error::create-popular-site/package.json says $CREATE; bump it to ${{ inputs.version }} in the versioning PR"; exit 1; }
+
+      - name: Refuse to release out of parity
+        run: |
+          git clone --depth 1 https://github.com/Mariatta/hugo-theme-popular ../hugo-theme-popular
+          bash scripts/sync-shared.sh --check
+
+      - name: Tag and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.version }}"
+          awk -v ver="$V" '$0 ~ "^## \\[" ver "\\]" {flag=1; next} /^## \[/{flag=0} flag' CHANGELOG.md \
+            | sed '/./,$!d' > /tmp/notes.md
+          echo "--- release notes ---"; cat /tmp/notes.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$V" -m "Popular v$V"
+          git push origin "v$V"
+          gh release create "v$V" --title "Popular v$V" --notes-file /tmp/notes.md
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 ships npm >= 11.5.1, required for trusted publishing
+          node-version: 24
+
+      - name: Publish astro-theme-popular to npm (trusted publishing)
+        # No token: npm authenticates via the workflow's OIDC identity.
+        # Requires the Trusted Publisher configured on npmjs.com for this
+        # repo + workflow file (see RELEASING.md). Provenance is automatic.
+        working-directory: package
+        run: |
+          npm --version
+          npm publish
+
+      - name: Publish create-popular-site to npm (trusted publishing)
+        # The scaffolder is a second package with its own Trusted Publisher
+        # entry on npmjs.com. Its prepack collects templates/ from demos/, so
+        # publishing must happen from a checkout that still has them.
+        working-directory: create-popular-site
+        run: npm publish
+
+      - name: Smoke-test what was actually published
+        # The scaffolder CI job installs the theme from this checkout, which is
+        # right for a PR but can never catch a mismatch between two *published*
+        # versions. That gap shipped a create-popular-site whose templates
+        # needed a theme newer than the one it pinned, so every scaffolded site
+        # failed to build. This is the only place that is detectable.
+        run: |
+          V="${{ inputs.version }}"
+          # npm's CDN can lag minutes behind a publish (v0.13.0 took over a
+          # minute to appear). Poll both packages: the scaffold needs
+          # create-popular-site and its npm install needs the theme. Fail
+          # here with a clear message rather than falling through to the
+          # scaffold's confusing E404 wall.
+          for pkg in create-popular-site astro-theme-popular; do
+            for i in $(seq 1 60); do
+              npm view "$pkg@$V" version >/dev/null 2>&1 && break
+              if [ "$i" = 60 ]; then
+                echo "::error::$pkg@$V still not on the registry after 10 minutes"
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+          cd "$(mktemp -d)"
+          npm create "popular-site@$V" -- smoke-site --template starter --yes
+          cd smoke-site
+          grep -q "\"astro-theme-popular\": \"^$V\"" package.json \
+            || { echo "::error::scaffolded site does not pin ^$V"; exit 1; }
+          npm install
+          npx astro build
+          test -f dist/index.html

@@ -1,0 +1,95 @@
+name: Deploy Astro demo sites (GitHub Pages)
+
+# Builds the neutral starter, the four flavored demo sets, and the gallery:
+#
+#   /            ← demos/starter (Your Community, the neutral skeleton)
+#   /aquarium/   ← demos/aquarium (Rocky Cove Aquarium Club, canonical)
+#   /foodie/     ← demos/foodie (Lucky Town Foodie Club)
+#   /kdrama/     ← demos/kdrama (KDrama Fan Club)
+#   /superfan/   ← demos/superfan (Truly Madly Riley, a personal site)
+#   /demos/      ← demos/gallery/index.html (the landing page)
+#
+# The starter is at the root because the root is the URL people are given,
+# including as the Demo link in the Astro theme catalogue, whose reviewers
+# require a live deployment of the repo "exactly as a new user will get".
+#
+# Each demo is built with Astro's `base` set to its subpath, so every link,
+# image, feed and absolute URL lands under it. See scripts/build-sites.mjs,
+# which the Netlify preview build runs too.
+#
+# Enable Pages first: repo Settings → Pages → Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # theme-repo only: forks inherit this file but must not run it
+    if: github.repository == 'Mariatta/astro-theme-popular'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build all demos
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          SITE_URL: ${{ steps.pages.outputs.origin }}
+        run: |
+          # One script, shared with the Netlify preview build, so a preview
+          # cannot quietly differ from production (scripts/build-sites.mjs).
+          # Each demo is built with Astro's own --base; this used to be a sed
+          # pass over the built HTML, which could not reach canonical, og:image
+          # or JSON-LD, and has been unnecessary since the theme became
+          # base-aware in 0.9.0.
+          node scripts/build-sites.mjs "$SITE_URL" "$BASE_PATH" public
+
+
+      - name: No internal link may escape the base path
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          # Root-relative href/src that skips the base path 404s on the
+          # subpath deployment (the bug class fixed by rel-href). Quoted or
+          # minified-unquoted attributes both match; // (protocol-relative)
+          # is external and exempt.
+          if [ -z "$BASE_PATH" ]; then echo "root deployment; nothing to scan"; exit 0; fi
+          leaks=$(grep -rhoE '(href|src)="?/[^/][^" >]*' public --include='*.html' \
+                  | grep -vE "^(href|src)=\"?$BASE_PATH(/|\"|$)" | sort -u | head -20 || true)
+          if [ -n "$leaks" ]; then
+            echo "::error::internal links escape $BASE_PATH:"; echo "$leaks"; exit 1
+          fi
+          echo "no escapes"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

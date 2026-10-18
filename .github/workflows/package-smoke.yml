@@ -1,0 +1,251 @@
+# Phase 1 of PACKAGING.md: build the packaged theme's smoke consumer and
+# keep the transitional copies (src/ template model vs package/) identical.
+name: Package smoke build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    # theme-repo only: forks inherit this file but must not run it
+    if: github.repository == 'Mariatta/astro-theme-popular'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install the workspace
+        # Since phase 3 the repo is an npm workspace, so one install at the root
+        # links the package into every member and resolves the package's own
+        # deps (@astrojs/rss) and the astro binary. The smoke consumer still
+        # consumes the package exactly as an adopter does; it is just no longer
+        # installed separately.
+        run: npm ci
+      - name: Transitional drift guard (template model vs package)
+        run: |
+          # Until the phase-4 cutover, theme code exists twice in this repo.
+          # The package copies must match the canonical src/ + public/ files:
+          # byte-identical for styles/scripts, identical after normalizing the
+          # config import (src uses ../config, the package uses popular:config).
+          diff -r src/styles package/src/styles
+          diff -r public/scripts package/scripts
+          norm() {
+            mkdir -p "/tmp/norm/$2"
+            (cd "$1" && find . -type f | while read -r f; do
+              mkdir -p "/tmp/norm/$2/$(dirname "$f")"
+              sed -E "s#from '(\.\./)+config'#from 'THEME_CONFIG'#; s#from 'popular:config'#from 'THEME_CONFIG'#; s#from '(\.\./)+components/([A-Za-z]+)\.astro'#from 'THEME_COMPONENT/\2'#; s#from 'popular:component/([A-Za-z]+)'#from 'THEME_COMPONENT/\1'#" "$f" > "/tmp/norm/$2/$f"
+            done)
+          }
+          # BaseLayout.astro is the one designed divergence: the package
+          # version has no static /scripts tags (the integration injects
+          # them); mirror edits to it by hand, everything else must match.
+          for d in components layouts pages lib; do
+            rm -rf /tmp/norm; norm "src/$d" a; norm "package/src/$d" b
+            diff -r -x BaseLayout.astro /tmp/norm/a /tmp/norm/b
+          done
+      - name: Build the smoke consumer
+        run: npm run build --workspace smoke
+      - name: Output guards
+        run: |
+          python3 scripts/check-image-alt.py smoke/dist
+          if grep -rl --include='*.html' '&amp;amp;' smoke/dist; then
+            echo "::error::double-escaped ampersand in smoke output"; exit 1
+          fi
+          # rest params: a folder-organized content id must build
+          test -f smoke/dist/speakers/2026-summit/nested-guest/index.html
+          # nested page renders a back-link labeled by the parent's shortTitle
+          grep -q 'fa-arrow-left.*</i> Policies' smoke/dist/policies/conduct/index.html
+          # organizer profile page renders the persona/bio card
+          grep -q 'g-persona' smoke/dist/organizers/sam/index.html
+          # @count:<section> stat resolves to a live number (starter has 1 post)
+          grep -qE 'g-stat__n">1</div><div class="g-stat__l">posts' smoke/dist/index.html
+          # SEO: robots.txt + sitemap emitted, og:locale present
+          grep -q 'Sitemap:' smoke/dist/robots.txt
+          test -f smoke/dist/sitemap-index.xml
+          grep -q 'og:locale' smoke/dist/index.html
+          # JSON-LD valid across the built output (events, org, blog, faq)
+          python3 scripts/check-jsonld.py smoke/dist
+          # event time-parsing vectors end to end
+          grep -q '2026-09-19T18:00' smoke/dist/events/v1/index.html
+          grep -q '"startDate":"2026-09-19"' smoke/dist/events/v6/index.html
+          # FAQ: native details + FAQPage JSON-LD collected from slots
+          grep -q 'g-faq__item' smoke/dist/faq-test/index.html
+          grep -q 'FAQPage' smoke/dist/faq-test/index.html
+          # iCal feed: valid, UID absolute, floating DTSTART
+          python3 scripts/check-ics.py smoke/dist
+          grep -q 'BEGIN:VCALENDAR' smoke/dist/events/calendar.ics
+          # Notice banner (§5): rendered above header, inline markdown applied,
+          # optional link present
+          grep -q 'class="g-notice" role="status"' smoke/dist/index.html
+          grep -q '<strong>Stay tuned</strong>' smoke/dist/index.html
+          grep -q '>Learn more</a>' smoke/dist/index.html
+          # Community chat bridge (§4): CTA in the home hero + a footer link
+          grep -q 'g-btn--secondary" href="https://example.com/chat"' smoke/dist/index.html
+          grep -q 'fa-comments' smoke/dist/index.html
+          # Speakers/venues list pages exist (fixes the backlinks that 404'd)
+          test -f smoke/dist/speakers/index.html
+          test -f smoke/dist/venues/index.html
+          # Speaker invite card (§7) appended to the speakers list
+          grep -q 'Your name here?' smoke/dist/speakers/index.html
+          grep -q 'href="/speak/"' smoke/dist/speakers/index.html
+          # Talk archive (§3): event Talks section, row recording cue, /talks/ index
+          grep -q 'g-talk__title">A recorded talk' smoke/dist/events/v1/index.html
+          grep -q 'fa-circle-play.*</i>Recording available' smoke/dist/events/index.html
+          test -f smoke/dist/talks/index.html
+          grep -q 'g-talk__title">A recorded talk' smoke/dist/talks/index.html
+          grep -q 'data-filterbar' smoke/dist/talks/index.html
+          # Gallery + pull-quote (§6) render from the package components
+          grep -q 'g-gallery__item' smoke/dist/faq-test/index.html
+          grep -q 'g-pullquote' smoke/dist/faq-test/index.html
+          # llms.txt (§8): plain-text summary, names the next event
+          test -f smoke/dist/llms.txt
+          grep -q 'Next event:' smoke/dist/llms.txt
+          grep -q 'Calendar feed' smoke/dist/llms.txt
+      - name: Route opt-outs build
+        working-directory: smoke
+        run: |
+          npx astro build --config astro.optout.config.mjs
+          test ! -d dist-optout/speakers
+          test ! -d dist-optout/venues
+          test ! -f dist-optout/rss.xml
+          test -d dist-optout/events
+          test ! -d dist-optout/organizers
+      - name: Renamed sections build
+        working-directory: smoke
+        run: |
+          npx astro build --config astro.sections.config.mjs
+          # byline resolves from the organizers collection, links there
+          grep -q '/organizers/sam/' dist-sections/blog/hello-world/index.html
+      - name: Component override build
+        working-directory: smoke
+        run: |
+          npx astro build --config astro.overrides.config.mjs
+          # the custom Header replaces the theme default
+          grep -q 'OVERRIDDEN HEADER' dist-overrides/index.html
+          ! grep -q 'g-navlinks' dist-overrides/index.html
+      - name: Preview-mode build
+        working-directory: smoke
+        run: |
+          # A generator sets SITE.previewMode on its throwaway build; the config
+          # it writes into the adopter's repo never does. Assert both halves.
+          npx astro build --config astro.preview.config.mjs
+          grep -q 'class="g-previewbar"' dist-preview/index.html
+          grep -q 'Expires in 60 minutes.' dist-preview/index.html
+          if grep -rl --include='*.html' 'g-previewbar' dist; then
+            echo "::error::the preview bar reached a build that did not ask for it"; exit 1
+          fi
+      - name: "Subpath build (base: /sub)"
+        working-directory: smoke
+        run: |
+          npx astro build --config astro.base.config.mjs
+          # Every internal href and src must carry the base. Astro rewrites the
+          # asset URLs it emits itself, so anything left at the root is a path
+          # the theme wrote by hand and forgot to pass through withBase()
+          # (src/lib/url.ts). Note this deliberately does NOT exempt href="/":
+          # the brand link in the header is exactly that, and is the first
+          # thing to break on a subpath install.
+          if grep -rhoE '(href|src)="/[^"]*"' dist-base --include='*.html' \
+             | grep -vE '^(href|src)="/sub' | sort -u | grep .; then
+            echo "::error::internal link or asset missing the base prefix"; exit 1
+          fi
+          # Absolute URLs (feeds, canonicals, structured data) resolve against
+          # site + base, not site alone.
+          grep -q '<link rel="canonical" href="https://example.com/sub/blog/hello-world/"' dist-base/blog/hello-world/index.html
+          grep -q 'Sitemap: https://example.com/sub/sitemap-index.xml' dist-base/robots.txt
+          grep -q 'https://example.com/sub/events/' dist-base/llms.txt
+          grep -q 'https://example.com/sub/events/' dist-base/events/calendar.ics
+          grep -q '<link>https://example.com/sub/blog/hello-world/</link>' dist-base/rss.xml
+          # markdown bodies: links and images written as /path get the prefix
+          grep -q 'href="/sub/handbook/"' dist-base/runbooks/index.html
+          python3 ../scripts/check-image-alt.py dist-base
+          python3 ../scripts/check-jsonld.py dist-base
+          python3 ../scripts/check-ics.py dist-base
+
+  scaffolder:
+    # `npm create popular-site@latest` is how a site starts once the cutover removes
+    # "copy the repo", so it has to be proven the same way the package is: by
+    # running it and building what it wrote. It is also the only place the
+    # pack-time templates/ directory gets exercised.
+    if: github.repository == 'Mariatta/astro-theme-popular'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: The tarball carries the templates
+        # templates/ is gitignored and written by prepack, so the failure mode
+        # is publishing a scaffolder that can scaffold nothing. `files` lists
+        # it and .npmignore stops .gitignore from excluding it again; this
+        # asserts that combination still holds.
+        working-directory: create-popular-site
+        run: |
+          npm pack --dry-run 2>&1 | tee /tmp/pack.out
+          grep -q 'templates/starter/popular.config.ts' /tmp/pack.out
+          grep -q 'templates/aquarium/src/content/' /tmp/pack.out
+          # the project files shared with scripts/setup.py travel too, or the
+          # scaffolder has nothing to render astro.config.mjs from
+          grep -q 'templates/_shared/astro.config.package.mjs.tmpl' /tmp/pack.out
+          grep -q 'templates/_shared/package.json.tmpl' /tmp/pack.out
+
+      - name: Scaffold a site and build it
+        run: |
+          node create-popular-site/scripts/collect-templates.mjs
+          cd "$(mktemp -d)"
+          node "$GITHUB_WORKSPACE/create-popular-site/index.mjs" my-community \
+            --template aquarium --site https://you.github.io/my-community/ --yes
+          cd my-community
+          # The scaffolder writes a registry range; point it at this checkout so
+          # CI tests the code in the PR rather than the last published release.
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.dependencies['astro-theme-popular'] = 'file:$GITHUB_WORKSPACE/package';
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
+          "
+          npm install
+          npx astro build
+          echo "SCAFFOLD_DIR=$PWD" >> "$GITHUB_ENV"
+
+      - name: The scaffolded site is correct
+        run: |
+          cd "$SCAFFOLD_DIR"
+          python3 "$GITHUB_WORKSPACE/scripts/check-image-alt.py" dist
+          python3 "$GITHUB_WORKSPACE/scripts/check-jsonld.py" dist
+          python3 "$GITHUB_WORKSPACE/scripts/check-ics.py" dist
+          # site/base split: a project-page URL becomes site + base, and every
+          # internal link carries the base
+          grep -q "site: 'https://you.github.io'" astro.config.mjs
+          grep -q "base: '/my-community'" astro.config.mjs
+          if grep -rhoE '(href|src)="/[^"]*"' dist --include='*.html' \
+             | grep -vE '^(href|src)="/my-community' | sort -u | grep .; then
+            echo "::error::scaffolded site has an internal link missing the base"; exit 1
+          fi
+          # the demo switcher must never reach a real community's site
+          grep -q 'export const DEMO_BAR = null;' popular.config.ts
+          if grep -rl --include='*.html' 'g-demobar' dist; then
+            echo "::error::the demo bar reached a scaffolded site"; exit 1
+          fi
+          # nor the published starter's "see the other demos" notice, which
+          # lives in demos/starter/popular.deploy.config.ts precisely so that
+          # the scaffolder, which templates from popular.config.ts, cannot see
+          # it. A real community linking to this project's demo gallery would
+          # be the same class of mistake as shipping the demo bar.
+          #
+          # Match that notice's text, not the g-notice class: the notice banner
+          # is a feature, several demos set one of their own, and adopters are
+          # meant to. Only this project's gallery pitch is forbidden.
+          if grep -rl --include='*.html' 'Four complete demo sites' dist; then
+            echo "::error::the deploy-only notice reached a scaffolded site"; exit 1
+          fi
+          if grep -q '/demos/' popular.config.ts; then
+            echo "::error::scaffolded config links the demo gallery"; exit 1
+          fi

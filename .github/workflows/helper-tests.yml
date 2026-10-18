@@ -1,0 +1,79 @@
+name: Helper script tests
+
+# Unit tests for the Python helper scripts (importers, sponsor updater).
+# Standard library only: no dependencies to install.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s scripts/tests -v
+      - name: Parity check against hugo-theme-popular
+        run: |
+          # Lockstep changes (a Tier-1 file added in both repos) use the SAME
+          # branch name in both repos; prefer that branch on the sibling so
+          # paired PRs check against each other, not against stale main.
+          BRANCH="${{ github.head_ref || github.ref_name }}"
+          # Say which ref we ended up comparing against. Without this a paired
+          # PR whose sibling branch is not pushed yet fails as "DRIFT" on the
+          # shared CHANGELOG, which reads like real drift and is not.
+          if git clone --depth 1 -b "$BRANCH" https://github.com/Mariatta/hugo-theme-popular ../hugo-theme-popular; then
+            echo "::notice::compared against hugo-theme-popular branch $BRANCH"
+          elif git clone --depth 1 https://github.com/Mariatta/hugo-theme-popular ../hugo-theme-popular; then
+            echo "::warning::hugo-theme-popular has no branch $BRANCH; compared against its default branch. If this is a paired PR, push the sibling branch and re-run."
+          else
+            echo "::notice::sibling repo not clonable; parity check skipped"; exit 0
+          fi
+          git -C ../hugo-theme-popular log --oneline -1
+          bash scripts/sync-shared.sh --check
+
+  e2e-wizard:
+    # End-to-end: run scripts/setup.py over the neutral starter with a fixture
+    # answer file, then confirm the generated site builds and the answers
+    # reached the rendered HTML.
+    #
+    # There is no activation step since packaging phase 3: `src/` *is* the
+    # template-model starter, committed pristine, so a fresh checkout is
+    # already the state this test needs. (`npm run demo:starter` now starts a
+    # dev server for the demo workspace and would hang here.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run the wizard over the starter
+        run: |
+          # No --force: an unedited starter's config and CoC page are pristine,
+          # so the wizard adopts them. A regression would exit 1 here.
+          POPULAR_SETUP_DATE=2026-08-03 python3 scripts/setup.py \
+            --site . --format astro \
+            --answers scripts/tests/fixtures/answers-full.json | tee /tmp/wizard.out
+          grep -q "Adopted unedited starter file" /tmp/wizard.out
+      - name: Wizard wrote the config, seed, audit trail and answer record
+        run: |
+          test -f DECISIONS.md
+          test -f .popular-setup.json
+          grep -q "PyLadies Vancouver" src/config.ts
+          grep -q "coc@" src/content/pages/code-of-conduct.mdx
+      - name: The generated site builds
+        run: npm run build
+      - name: The answers reached the rendered HTML
+        run: |
+          grep -rq "PyLadies Vancouver" dist
+          grep -rq "coc@" dist
+
